@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*- 1
+# -*- coding: utf-8 -*- 
 #=============================================
 # 본 프로그램은 자이트론에서 제작한 것입니다.
 # 상업라이센스에 의해 제공되므로 무단배포 및 상업적 이용을 금합니다.
@@ -12,12 +12,9 @@ from xycar_msgs.msg import XycarMotor
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
-from rclpy.duration import Duration
 from cv_bridge import CvBridge
 
-# [추가] 외부 차선 인식 노드의 토픽을 받기 위한 ROS2 표준 메시지
-from std_msgs.msg import Float32MultiArray, Bool
-# [추가] 외부 차선 및 라이다 노드의 토픽을 받기 위한 ROS2 표준 메시지
+# ROS2 표준 메시지
 from std_msgs.msg import Float32MultiArray, Bool, String
 
 #=============================================
@@ -25,290 +22,276 @@ from std_msgs.msg import Float32MultiArray, Bool, String
 #=============================================
 class TrackDriverNode(Node):
 
-    #=============================================
-    # 클래스 생성 초기화 함수
-    #=============================================
     def __init__(self):
-
         super().__init__('driver')
         self.get_logger().info('----- Xycar self-driving node started -----')
         
         # 상수값 및 초기값 설정
-        self.image = None  # 카메라 토픽 데이터를 저장할 변수
-        self.motor_msg = XycarMotor()  # 모터토픽 메시지        
+        self.image = None  
+        self.motor_msg = XycarMotor()        
         self.lidar_ranges = None
         self.bridge = CvBridge()
 
-        # 차량 내부 이미지 크기 기본 규격 정의 (Sliding window 이미지 크기 기준)
         self.img_w = 640
         self.img_h = 480
         
-        # ROS2 Publisher & Subscriber 설정
-        self.motor_pub = self.create_publisher(XycarMotor,'xycar_motor',10)
+        # ROS2 Publisher 설정
+        self.motor_pub = self.create_publisher(XycarMotor, 'xycar_motor', 10)
         
+        # ROS2 Subscriber 설정
         self.sub_front = self.create_subscription(
             Image, '/usb_cam/image_raw/front', self.cam_callback, qos_profile_sensor_data)
 
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.lidar_callback, qos_profile_sensor_data)
-		
-        # [수정] /vision/lane_fit_x 토픽을 Float32MultiArray 데이터형으로 구독하도록 변경
+        
         self.sub_fit_x = self.create_subscription(
             Float32MultiArray, '/vision/lane_fit_x', self.lane_fit_x_callback, 10)
             
-        self.sub_valid = self.create_subscription(
+        self.sub_lane_valid = self.create_subscription(
             Bool, '/vision/lane_valid', self.lane_valid_callback, 10)
+            
+        self.sub_cone_valid = self.create_subscription(
+            Bool, '/vision/cone_valid', self.cone_valid_callback, 10)
 
-        # --------------------------------------------------------
-        # [신규 추가] 라이다 장애물 상태 토픽 구독 설정
-        # --------------------------------------------------------
         self.sub_obstacle = self.create_subscription(
             String, '/lidar/obstacle_status', self.obstacle_status_callback, 10)
 
         # --------------------------------------------------------
-        # [신규 추가] 상태 제어 변수 및 모듈별 퍼블리셔 초기화
+        # 상태 제어 변수 초기화
         # --------------------------------------------------------
-        self.prev_angle = 0.0  # 차선 소실 시 유지할 이전 조향각 백업 변수
-        self.current_state = "STRAIGHT" # 초기 차량 상태 (STRAIGHT / CURVE / EMERGENCY)
-        self.lane_valid_status = True
+        self.prev_angle = 0.0  
+        self.current_state = "CONE_DRIVING" # 초기 시작 상태를 라바콘 모드로 명시적 설정
+        
+        self.lane_valid_status = False
+        self.cone_valid_status = False
 
-        # [신규 변수] 실시간 라이다 회피 상태 및 변이 오프셋 저장 변수
         self.obstacle_state = "NONE"
         self.obstacle_offset = 0  
-
         self.straight_consecutive_count = 0
 
-        self.get_logger().info("Track Driver Node Initialized")
+        self.get_logger().info("Track Driver Node Initialized with Dedicated CONE_DRIVING mode")
 
     #=============================================
-    # [신규 수신 콜백] 라이다 노드로부터 장애물 위험 신호 수신
+    # 라이다 노드로부터 장애물 위험 신호 수신
     #=============================================
     def obstacle_status_callback(self, msg):
+        # 🎯 [추가] 라바콘 주행 중일 때는 장애물 신호를 아예 접수하지 않음
+        if self.current_state == "CONE_DRIVING":
+            self.obstacle_state = "NONE"
+            self.obstacle_offset = 0
+            return
+
         self.obstacle_state = msg.data
-        
-        # ⚙️ [오프셋 픽셀 튜닝 포인트] 
-        # 시뮬레이터 차량이 회피 기동을 너무 소심하게 하거나 과하게 할 때 이 값을 조정하세요.
         OFFSET_PIXEL = 130  
         
         if self.obstacle_state == "LEFT":
-            # 왼쪽에 장애물 출현 -> 타겟 중심을 우측(+)으로 밀어 우회전 유도
             self.obstacle_offset = -OFFSET_PIXEL
         elif self.obstacle_state == "RIGHT":
-            # 오른쪽에 장애물 출현 -> 타겟 중심을 좌측(-)으로 당겨 좌회전 유도
             self.obstacle_offset = OFFSET_PIXEL
         else:
-            # 장애물 없음 -> 오프셋 초기화 (정중앙 주행)
             self.obstacle_offset = 0
 
     #=============================================
-    # [수정] 변경된 차선 픽셀 배열(fit_x) 수신 콜백 함수
+    # 차선 및 가상 차선 픽셀 배열(fit_x) 수신 콜백 함수
     #=============================================
     def lane_fit_x_callback(self, msg):
-        # 배열 데이터가 비어있지 않고 차선 유효성이 정상일 때 제어 실행
-        if msg.data and self.lane_valid_status:
+        is_any_valid = self.lane_valid_status or self.cone_valid_status
+        if msg.data and is_any_valid:
             fit_x = np.array(msg.data)
             self.process_autonomous_driving(fit_x)
 
     #=============================================
-    # 외부 차선 노드로부터 유효성을 받는 콜백 함수
+    # 카메라 노드 유효성 수신 콜백
     #=============================================
     def lane_valid_callback(self, msg):
         self.lane_valid_status = msg.data
-        if not self.lane_valid_status:
-            self.current_state = "EMERGENCY"
-            # 차선 소실 즉시 비상 주행 로직 가동
-            self.process_autonomous_driving(None) 
+        self.check_emergency_fallback()
 
     #=============================================
-    # 카메라 토픽을 수신하는 콜백 함수
+    # 라바콘 노드 유효성 수신 콜백
     #=============================================
+    def cone_valid_callback(self, msg):
+        self.cone_valid_status = msg.data
+        self.check_emergency_fallback()
+
+    def check_emergency_fallback(self):
+        # 어떤 노드도 유효 차선을 주지 못할 때만 EMERGENCY 상태로 빠집니다.
+        if not self.lane_valid_status and not self.cone_valid_status:
+            if self.current_state != "EMERGENCY":
+                self.current_state = "EMERGENCY"
+                self.process_autonomous_driving(None)
+
     def cam_callback(self, data):
-        # 수신한 메시지를 OpenCV 이미지로 변환하여 저장
         self.image = self.bridge.imgmsg_to_cv2(data, "bgr8")
     
-    #=============================================
-    # 라이다 토픽을 수신하는 콜백 함수
-    #=============================================
     def lidar_callback(self, msg):
         self.lidar_ranges = msg.ranges   
       
-    #=============================================
-    # 모터제어 토픽을 발행하는 Publisher 함수
-    #=============================================
     def drive(self, angle, speed):
         self.motor_msg.angle = float(angle)
         self.motor_msg.speed = float(speed)
         self.motor_pub.publish(self.motor_msg)
 
     ##################################################
-    # STEERING CALCULATION
+    # STEERING CALCULATION (조향 제어 연산)
     ##################################################
-
-    def calculate_angle(
-        self,
-        fit_x,
-        image_width,
-        image_height,
-        look_ahead_ratio,
-        Kp,
-        offset=0
-    ):
-
-        image_center = image_width//2
+    def calculate_angle(self, fit_x, image_width, image_height, look_ahead_ratio, Kp, offset=0):
+        image_center = image_width // 2
         center_offset = offset
         target_center = image_center + center_offset
 
-        look_ahead_index = int(image_height * look_ahead_ratio)
+        # 🎯 [인덱싱 수정] look_ahead_ratio가 커질수록 하단(근거리 차량 코앞)을 정방향 조준합니다.
+        look_ahead_index = int((image_height - 1) * look_ahead_ratio)
+        look_ahead_index = np.clip(look_ahead_index, 0, len(fit_x) - 1)
+        
         target_lane_x = fit_x[look_ahead_index]
-
         error = target_lane_x - target_center
 
-        steering_deg = Kp*error
-
-        steering_deg = np.clip(
-            steering_deg,
-            -20,
-            20
-        )
+        steering_deg = Kp * error
+        steering_deg = np.clip(steering_deg, -20.0, 20.0)
 
         angle_cmd = steering_deg * 5.0
-
         return angle_cmd
     
     def calculate_curvature(self, fit_x, image_height):
-        """
-        Sliding Window의 2차 다항식 결과(fit_x)로부터 곡률 반경(R)을 계산합니다.
-        fit_x는 이미지의 모든 y축(0 ~ h-1)에 대응하는 x 좌표 배열입니다.
-        """
         try:
-            # np.linspace로 fit_x와 매칭되는 y 배열 생성
             plot_y = np.linspace(0, image_height - 1, len(fit_x))
-            
-            # fit_x와 plot_y를 이용해 2차 다항식 계수(A, B, C)를 역으로 추출
             poly_coeffs = np.polyfit(plot_y, fit_x, 2)
             A = poly_coeffs[0]
             B = poly_coeffs[1]
             
-            # 차량 직전 전방(이미지 맨 하단 y지점)에서의 곡률 반경 계산
+            if np.abs(A) < 1e-5:
+                return 99999.0
+
             y_eval = image_height - 1
-            
-            # 공식 적용: R = [1 + (2Ay + B)^2]^1.5 / |2A|
             numerator = (1 + (2 * A * y_eval + B) ** 2) ** 1.5
             denominator = np.abs(2 * A)
             
-            if denominator < 1e-6:  # 분모가 0이 되는 것 방지 (완벽한 직선)
+            if denominator < 1e-6:
                 return 99999.0
                 
             curvature_radius = numerator / denominator
             return curvature_radius
-            
         except Exception as e:
             return 99999.0
 
-    #=============================================
-    # 메인 루프
-    #=============================================
     def main_loop(self):
-    
         self.get_logger().info("======================================")
         self.get_logger().info("  S T A R T    D R I V I N G ...      ")
         self.get_logger().info("======================================")
-
-        # rclpy.spin을 통해 이벤트 드리븐 방식으로 동작하도록 무한 루프 제어권 이양
         rclpy.spin(self)
 
     # ==============================================================================
-    # [구조 고침] 상태 판단 FSM -> 가변 파라미터 적용 통합 파이프라인
-    # ==============================================================================
-    # ==============================================================================
-    # [개선 고침] 3단계 다단 FSM 상태 판단 및 가변 파라미터 제어 파이프라인
+    # 🎯 [구조 개선] 전용 CONE_DRIVING 상태가 추가된 자율주행 주행 파이프라인
     # ==============================================================================
     def process_autonomous_driving(self, fit_x):
         try:
-            # 1. EMERGENCY 상태 탈출 먼저 처리 (안전장치)
-            if self.current_state == "EMERGENCY" and self.lane_valid_status and fit_x is not None:
-                self.current_state = "STRAIGHT"
-
-            # 2. 차선 소실 상태가 아니라면 '곡률 반경(R)' 기반으로 상태(FSM) 판단
-            if self.current_state != "EMERGENCY" and fit_x is not None:
-                R = self.calculate_curvature(fit_x, self.img_h)
-                
-                SHARP_CURVE_THRESHOLD = 500.0  # 이 값보다 작으면 무조건 '심한 곡선'
-                STRAIGHT_THRESHOLD = 1000.0    # 이 값보다 크면 '직선'
-                
-                if R <= SHARP_CURVE_THRESHOLD:
-                    self.straight_consecutive_count = 0
-                    self.current_state = "SHARP_CURVE"
-                elif SHARP_CURVE_THRESHOLD < R <= STRAIGHT_THRESHOLD:
-                    self.straight_consecutive_count = 0
-                    self.current_state = "SOFT_CURVE"
-                else:
-                    self.straight_consecutive_count += 1
-
-                # 직선 진입 노이즈 필터링
-                STRAIGHT_STREAK_REQUIRED = 8  
-                if self.straight_consecutive_count >= STRAIGHT_STREAK_REQUIRED:
+            # 1. EMERGENCY 상태 복구 조건 검사
+            if self.current_state == "EMERGENCY" and fit_x is not None:
+                if self.cone_valid_status:
+                    self.current_state = "CONE_DRIVING"
+                elif self.lane_valid_status:
                     self.current_state = "STRAIGHT"
-                    self.straight_consecutive_count = STRAIGHT_STREAK_REQUIRED
 
-            # 3. 3단계 상태별 가변 파라미터 적용 및 제어값 산출
+            # 2. 유효 플래그에 따른 마스터 상태 판단 (라바콘 주행 모드 전환 우선권 제어)
+            if self.current_state != "EMERGENCY" and fit_x is not None:
+                
+                if self.cone_valid_status:
+                    # 🎯 라바콘 유효 신호가 살아있다면 복잡한 곡률 계산 FSM을 전면 스킵하고 모드 고정!
+                    self.current_state = "CONE_DRIVING"
+                    self.obstacle_offset = 0
+                    
+                elif self.lane_valid_status:
+                    # 라바콘 모드가 끝나고 진짜 카메라 차선이 켜지면 원래의 곡률 기반 3단계 FSM 구동
+                    if self.current_state == "CONE_DRIVING": 
+                        self.current_state = "STRAIGHT" # 라바콘에서 차선모드로 변환 시 초기화
+                    
+                    R = self.calculate_curvature(fit_x, self.img_h)
+                    SHARP_CURVE_THRESHOLD = 500.0  
+                    STRAIGHT_THRESHOLD = 1000.0    
+                    
+                    if R <= SHARP_CURVE_THRESHOLD:
+                        self.straight_consecutive_count = 0
+                        self.current_state = "SHARP_CURVE"
+                    elif SHARP_CURVE_THRESHOLD < R <= STRAIGHT_THRESHOLD:
+                        self.straight_consecutive_count = 0
+                        self.current_state = "SOFT_CURVE"
+                    else:
+                        self.straight_consecutive_count += 1
+
+                    STRAIGHT_STREAK_REQUIRED = 8  
+                    if self.straight_consecutive_count >= STRAIGHT_STREAK_REQUIRED:
+                        self.current_state = "STRAIGHT"
+                        self.straight_consecutive_count = STRAIGHT_STREAK_REQUIRED
+
+            # 3. 각 주행 모드(FSM 상태)별 가변 파라미터 적용 및 명령 산출
             final_angle = 0.0
             final_speed = 0.0
 
-            if self.current_state == "STRAIGHT":
-                # [직선] 멀리 보고(0.45), 매우 부드럽게 조향(0.015)하여 털림/지그재그 방지
+            # 🎯 [신규 추가] 라바콘 전용 주행 제어 파라미터 영역
+            if self.current_state == "CONE_DRIVING":
+                # 차량 코앞 가이드라인 중심(0.80)을 조준하고 강한 계수(0.32)로 꺾어 민첩성 최적화
+                target_ratio = 0.55 
+                target_Kp = 0.12    
+                final_speed = 10.0 
+                
+            # --------------------------------------------------------
+            # 카메라 차선 주행 파라미터 영역 (기존 요구 조건 그대로 유지)
+            # --------------------------------------------------------
+            elif self.current_state == "STRAIGHT":
                 target_ratio = 0.45 
-                target_Kp = 0.015  
+                target_Kp = 0.025   
                 final_speed = 13.0 if self.obstacle_offset != 0 else 16.0  
                 
             elif self.current_state == "SOFT_CURVE":
-                # [완만한 곡선] 중간을 보고(0.6), 적당한 강도로 조향(0.12) 및 약간의 감속
-                target_ratio = 0.6  
+                target_ratio = 0.60 
                 target_Kp = 0.12    
                 final_speed = 12.0
                 
             elif self.current_state == "SHARP_CURVE":
-                # [심한 곡선] 차량 바로 앞을 보고(0.8), 매우 강하게 회전(0.2) 및 확실한 감속
-                target_ratio = 0.8 
-                target_Kp = 0.2    
+                target_ratio = 0.80 
+                target_Kp = 0.20    
                 final_speed = 8.5   
                 
             elif self.current_state == "EMERGENCY":
-                # [비상] 차선 소실 시 이전 조향각과 안전 서행 속도 유지
-                target_ratio = 0.6
+                target_ratio = 0.60
                 target_Kp = 0.12
                 final_angle = self.prev_angle
                 final_speed = 7.0   
             else:
-                target_ratio = 0.6
+                target_ratio = 0.60
                 target_Kp = 0.12
                 final_speed = 5.0
 
-            # 4. 조향각 계산 및 명령 발행
+            # 4. 최종 조향각 연산 및 모터 제어 명령 발행
             if self.current_state != "EMERGENCY":
-                # 변화량 제한(Slew Rate) 없이, 계산된 각도를 즉시 핸들에 반영합니다.
+                
+                # 🎯 [수정 핵심] 현재 상태가 라바콘 주행 모드(CONE_DRIVING)라면
+                # 별도의 장애물 오프셋을 0으로 강제 초기화하여 이중 회피를 방지합니다.
+                current_offset = self.obstacle_offset
+                if self.current_state == "CONE_DRIVING":
+                    current_offset = 0  # 라바콘 자체를 장애물로 오인해 이중으로 꺾는 현상 원천 차단
+                
                 final_angle = self.calculate_angle(
-                    fit_x, self.img_w, self.img_h, target_ratio, target_Kp, self.obstacle_offset)
+                    fit_x, self.img_w, self.img_h, target_ratio, target_Kp, current_offset)
                 self.prev_angle = final_angle
 
             self.drive(final_angle, final_speed)
 
         except Exception as e:
-            self.get_logger().warn(f"State Control Error: {e}")
+            self.get_logger().warn(f"State Control Error in FSM: {e}")
             self.drive(self.prev_angle, 5.0)
             
 #=============================================
 # 메인 함수
 #=============================================
 def main(args=None):
-      
     rclpy.init(args=args)
     node = TrackDriverNode()
-	
     try:
         node.main_loop()
     except KeyboardInterrupt:
-
         pass
     finally:
         node.drive(angle=0, speed=0)
@@ -318,4 +301,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
