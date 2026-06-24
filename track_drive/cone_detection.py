@@ -97,7 +97,7 @@ class ConeDetectionNode(Node):
             pixel_x = np.clip(pixel_x, 0, self.img_w - 1)
             pixel_y = np.clip(pixel_y, 0, self.img_h - 1)
 
-            if pixel_x >= 320 or pixel_y < 120 or -0.4 < lidar_x < 0.4:
+            if pixel_x >= 320 or pixel_y < 120 or -1 < lidar_x < 1:
                 continue
 
             left_points.append([pixel_x, pixel_y, lidar_y])
