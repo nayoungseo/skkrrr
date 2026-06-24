@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import math
+import time
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String, Bool, Float32
-import math
-import numpy as np
+from std_msgs.msg import Bool, String
+
 
 class LidarProcessorNode(Node):
     def __init__(self):
         super().__init__('lidar_processor_node')
 
         self.lidar_ranges = None
+        self.angle_min = 0.0
+        self.angle_increment = math.radians(1.0)
         self.lane_valid_status = False
+        self.started_at = time.monotonic()
+        self.obstacle_detection_delay = 15.0
 
-        # --------------------------------------------------------
-        # ROS2 Subscriber / Publisher 설정 (원본 구조 100% 유지)
-        # --------------------------------------------------------
-        self.sub_lidar = self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
-        self.sub_lane_valid = self.create_subscription(Bool, '/vision/lane_valid', self.lane_valid_callback, 10)
+        self.sub_lidar = self.create_subscription(
+            LaserScan, '/scan', self.lidar_callback, 10)
+        self.sub_lane_valid = self.create_subscription(
+            Bool, '/vision/lane_valid', self.lane_valid_callback, 10)
 
-        self.pub_obstacle = self.create_publisher(String, '/lidar/obstacle_status', 10)
-        self.pub_cone_angle = self.create_publisher(Float32, '/lidar/cone_angle', 10)
-        self.pub_cone_valid = self.create_publisher(Bool, '/lidar/cone_valid', 10)
+        self.pub_obstacle = self.create_publisher(
+            String, '/lidar/obstacle_status', 10)
 
         self.obstacle_msg = String()
-        self.cone_angle_msg = Float32()
-        self.cone_valid_msg = Bool()
 
         self.timer = self.create_timer(0.1, self.timer_callback)
-        self.get_logger().info("✅ Lidar Processor Node Started (Multi-Zone Detection Active)")
+        self.get_logger().info(
+            "Lidar Processor Node Started (obstacle free-space mode)")
 
     def lidar_callback(self, msg):
-        self.lidar_ranges = msg.ranges   
+        self.lidar_ranges = msg.ranges
+        self.angle_min = msg.angle_min
+        self.angle_increment = msg.angle_increment
 
     def lane_valid_callback(self, msg):
         self.lane_valid_status = msg.data
@@ -44,121 +50,146 @@ class LidarProcessorNode(Node):
             return
 
         ranges = self.lidar_ranges
-        self.process_lavacone_calculations(ranges)
+        if time.monotonic() - self.started_at < self.obstacle_detection_delay:
+            self.obstacle_msg.data = "NONE"
+            self.pub_obstacle.publish(self.obstacle_msg)
+            left = self.obstacle_detection_delay - (time.monotonic() - self.started_at)
+            print(
+                f"[lidar] DETECTION_OFF {left:4.1f}s obstacle_status=NONE",
+                end='\r',
+                flush=True,
+            )
+            return
         self.process_obstacle_calculations(ranges)
 
-    def process_lavacone_calculations(self, ranges):
-        # (라바콘 주행 함수는 기존 코드와 완전히 동일하므로 생략하지 않고 그대로 유지)
-        total_points = len(ranges)
-        mid = total_points // 2  
-        cone_span = int(total_points * (45.0 / 360.0))
-        left_start = mid + int(total_points * (15.0 / 360.0))
-        left_end = left_start + cone_span
-        right_end = mid - int(total_points * (15.0 / 360.0))
-        right_start = right_end - cone_span
+    def scan_to_xy_points(self, ranges, min_range=0.15, max_range=8.0):
+        ranges_np, angles = self.scan_relative_angles_deg(ranges)
+        if ranges_np.size == 0:
+            return np.empty((0, 2), dtype=np.float32)
 
-        left_cone_dist = [r for r in ranges[left_start:left_end] if math.isfinite(r) and 0.1 < r < 1.5]
-        right_cone_dist = [r for r in ranges[right_start:right_end] if math.isfinite(r) and 0.1 < r < 1.5]
+        valid = (
+            np.isfinite(ranges_np) &
+            (ranges_np > min_range) &
+            (ranges_np < max_range)
+        )
 
-        avg_left = np.mean(left_cone_dist) if len(left_cone_dist) > 0 else 1.5
-        avg_right = np.mean(right_cone_dist) if len(right_cone_dist) > 0 else 1.5
+        if not np.any(valid):
+            return np.empty((0, 2), dtype=np.float32)
 
-        cone_error = avg_left - avg_right  
-        Kp_cone = 80.0 
-        cone_angle = cone_error * Kp_cone
-        cone_angle = float(np.clip(cone_angle, -20.0, 20.0))
+        valid_ranges = ranges_np[valid]
+        valid_angles = np.deg2rad(angles[valid])
+        x = valid_ranges * np.cos(valid_angles)
+        y = valid_ranges * np.sin(valid_angles)
+        return np.column_stack((x, y)).astype(np.float32)
 
-        is_cone_valid = not self.lane_valid_status
+    def nearest_path_distance(self, points, center_y, half_width, max_x):
+        if points.size == 0:
+            return max_x
 
-        self.cone_angle_msg.data = cone_angle
-        self.cone_valid_msg.data = is_cone_valid
-        self.pub_cone_angle.publish(self.cone_angle_msg)
-        self.pub_cone_valid.publish(self.cone_valid_msg)
+        in_path = (
+            (points[:, 0] > 0.15) &
+            (points[:, 0] < max_x) &
+            (np.abs(points[:, 1] - center_y) < half_width)
+        )
 
-    #=============================================
-    # [연산 2] 차량 회피용 장애물 상태 계산 (멀티존 튜닝 버전)
-    #=============================================
+        if not np.any(in_path):
+            return max_x
+
+        return float(np.min(points[in_path, 0]))
+
+    def scan_relative_angles_deg(self, ranges):
+        ranges_np = np.asarray(ranges, dtype=np.float32)
+        if ranges_np.size == 0:
+            return ranges_np, ranges_np
+
+        # The bundled lidar viewer maps index 0/359 to the vehicle's forward
+        # direction. Negative angle is left, positive angle is right.
+        indices = np.arange(ranges_np.size, dtype=np.float32)
+        angles = -indices * (360.0 / ranges_np.size)
+        angles = ((angles + 180.0) % 360.0) - 180.0
+        return ranges_np, angles
+
+    def corridor_stats(self, points, y_min, y_max, max_x):
+        if points.size == 0:
+            return max_x, 0, 0.0
+
+        selected = points[
+            (points[:, 0] > 0.35) &
+            (points[:, 0] < max_x) &
+            (points[:, 1] >= y_min) &
+            (points[:, 1] <= y_max)
+        ]
+
+        if selected.size == 0:
+            return max_x, 0, 0.0
+
+        clear = float(np.percentile(selected[:, 0], 20.0))
+        near = selected[selected[:, 0] <= clear + 0.45]
+        obstacle_y = float(np.median(near[:, 1])) if near.size > 0 else 0.0
+        return clear, int(selected.shape[0]), obstacle_y
+
+    def sector_distance(
+        self,
+        ranges_np,
+        angles,
+        angle_min,
+        angle_max,
+        min_range=0.35,
+        max_range=5.5,
+        percentile=20.0,
+    ):
+        sector = (
+            (angles >= angle_min) &
+            (angles <= angle_max) &
+            np.isfinite(ranges_np) &
+            (ranges_np > min_range) &
+            (ranges_np < max_range)
+        )
+
+        values = ranges_np[sector]
+        if values.size == 0:
+            return max_range, 0
+
+        return float(np.percentile(values, percentile)), int(values.size)
+
     def process_obstacle_calculations(self, ranges):
-        total_points = len(ranges)
-        
-        # --------------------------------------------------------
-        # ⚙️ [가변 파라미터 튜닝 구역 - 원거리/근거리 이중화]
-        # 시뮬레이션 환경에 따라 거리(m)와 각도를 조율하세요.
-        # --------------------------------------------------------
-        # 최소 데드존 (범용)
-        dist_min = 0.2
-        
-        # ZONE 1: 좁고 길게 보는 영역 (5도 ~ 25도)
-        z1_angle_min = 5.0
-        z1_angle_max = 25.0
-        z1_dist_max  = 8   # 👈 5~25도는 길게 감시 (1.5미터)
-        
-        # ZONE 2: 넓고 짧게 보는 영역 (26도 ~ 90도)
-        z2_angle_min = 26.0
-        z2_angle_max = 90.0
-        z2_dist_max  = 3   # 👈 26~90도는 짧게 감시 (0.6미터)
-        
-        trigger_count = 4    # 장애물 인정을 위한 최소 포인트 개수
-        # --------------------------------------------------------
+        ranges_np, angles = self.scan_relative_angles_deg(ranges)
+        points = self.scan_to_xy_points(ranges, min_range=0.35, max_range=5.8)
 
-        # 각도 비율을 인덱스 카운트로 환산
-        z1_narrow = int(total_points * (z1_angle_min / 360.0))
-        z1_wide   = int(total_points * (z1_angle_max / 360.0))
-        
-        z2_narrow = int(total_points * (z2_angle_min / 360.0))
-        z2_wide   = int(total_points * (z2_angle_max / 360.0))
+        detection_x = 5.8
+        stop_x = 0.9
+        min_pass_x = 1.5
+        min_path_points = 3
 
-        # --- 인덱스 슬라이싱 구역 분할 (정면 0도, 반시계+ 기준) ---
-        # 1-1. 좌측 원거리 존 (+5 ~ +25)
-        left_z1 = ranges[z1_narrow : z1_wide]
-        # 1-2. 좌측 근거리 존 (+26 ~ +90)
-        left_z2 = ranges[z2_narrow : z2_wide]
-        
-        # 2-1. 우측 원거리 존 (-25 ~ -5 => 335 ~ 355)
-        right_z1 = ranges[total_points - z1_wide : total_points - z1_narrow]
-        # 2-2. 우측 근거리 존 (-90 ~ -26 => 270 ~ 334)
-        right_z2 = ranges[total_points - z2_wide : total_points - z2_narrow]
+        front_clear, front_count = self.sector_distance(
+            ranges_np, angles, -8.0, 8.0, max_range=detection_x)
+        path_clear, path_count, obstacle_y = self.corridor_stats(
+            points, -1.05, 1.05, detection_x)
+        left_clear, left_count, _ = self.corridor_stats(
+            points, -1.65, -0.25, detection_x)
+        right_clear, right_count, _ = self.corridor_stats(
+            points, 0.25, 1.65, detection_x)
 
-        # --- 각 구역별 고유 거리 임계값을 대입하여 카운트 ---
-        left_z1_cnt = sum(1 for r in left_z1 if math.isfinite(r) and dist_min < r < z1_dist_max)
-        left_z2_cnt = sum(1 for r in left_z2 if math.isfinite(r) and dist_min < r < z2_dist_max)
-        
-        right_z1_cnt = sum(1 for r in right_z1 if math.isfinite(r) and dist_min < r < z1_dist_max)
-        right_z2_cnt = sum(1 for r in right_z2 if math.isfinite(r) and dist_min < r < z2_dist_max)
+        path_blocked = path_count >= min_path_points and path_clear < detection_x
+        no_escape = left_clear < min_pass_x and right_clear < min_pass_x
 
-        # 원거리든 근거리든 하나라도 카운트 기준을 넘으면 해당 방향 장애물로 판단
-        left_detected  = (left_z1_cnt >= trigger_count) or (left_z2_cnt >= trigger_count)
-        right_detected = (right_z1_cnt >= trigger_count) or (right_z2_cnt >= trigger_count)
-
-        # 🔀 [예외 처리] 좌우 모두 장애물이 감지된 경우!
-        if left_detected and right_detected:
-            # 유효한 거리 정보만 추출 (inf 제외)
-            left_valid_v = [r for r in list(left_z1)+list(left_z2) if math.isfinite(r) and dist_min < r < 1.5]
-            right_valid_v = [r for r in list(right_z1)+list(right_z2) if math.isfinite(r) and dist_min < r < 1.5]
-            
-            avg_left_dist = np.mean(left_valid_v) if len(left_valid_v) > 0 else 1.5
-            avg_right_dist = np.mean(right_valid_v) if len(right_valid_v) > 0 else 1.5
-            
-            # 왼쪽 장애물이 더 가깝다 = 오른쪽에 공간이 더 많다 ➡️ RIGHT 상태 발행 (우회전 유도)
-            if avg_left_dist < avg_right_dist:
-                status_str = "LEFT" # (기존 매핑 방식 유지: 왼쪽에 차가 있으니 우회전하라는 뜻)
-            
-            # 오른쪽 장애물이 더 가깝다 = 왼쪽에 공간이 더 많다 ➡️ LEFT 상태 발행 (좌회전 유도)
-            else:
-                status_str = "RIGHT"
-
-        # 기존 단일 감지 로직
-        elif left_detected:
-            status_str = "LEFT"
-        elif right_detected:
-            status_str = "RIGHT"
+        if path_clear < stop_x and no_escape:
+            status_str = "STOP"
+        elif path_blocked:
+            status_str = "AVOID_RIGHT" if obstacle_y <= 0.0 else "AVOID_LEFT"
         else:
             status_str = "NONE"
 
-        # 🖥️ 디버깅 전용 원라인 모니터링 로그 출력
-        print(f"[라이다] 상태: {status_str:<5} | 좌측(원거{left_z1_cnt} / 근거{left_z2_cnt}) | 우측(원거{right_z1_cnt} / 근거{right_z2_cnt})", end='\r', flush=True)
+        print(
+            f"[lidar] {status_str:<11} "
+            f"front(-8~8)={front_clear:4.2f}m/{front_count:02d} "
+            f"path={path_clear:4.2f}m/{path_count:02d}/y={obstacle_y:+.2f} "
+            f"left={left_clear:4.2f}m/{left_count:02d} "
+            f"right={right_clear:4.2f}m/{right_count:02d}",
+            end='\r',
+            flush=True,
+        )
 
-        # 토픽 발행
         self.obstacle_msg.data = status_str
         self.pub_obstacle.publish(self.obstacle_msg)
 
@@ -174,6 +205,7 @@ def main(args=None):
         print("\nNode shutting down.")
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

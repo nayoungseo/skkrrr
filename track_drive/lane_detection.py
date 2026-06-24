@@ -27,9 +27,9 @@ class LaneDetectionNode(Node):
 
         # 주행 시 시각화 창을 켤지 말지 결정하는 변수 (실전 주행 시 False로 변경)
         self.DEBUG = True
-
-        # [추가] 라바콘 모드가 켜져 있는 동안 카메라 연산/발행을 제어하기 위한 플래그
-        self.cone_mode_active = True  # 초기값은 라바콘 모드로 대기
+        self.last_fit_x = None
+        self.lost_frame_count = 0
+        self.cone_mode_active = True
 
         ##################################################
         # SUBSCRIBE
@@ -42,10 +42,9 @@ class LaneDetectionNode(Node):
             qos_profile_sensor_data
         )
 
-        # 🎯 [추가] 라바콘 노드가 "이제 카메라 모드로 넘어가라!"라고 신호를 주는지 모니터링
         self.sub_lane_switch = self.create_subscription(
             Bool,
-            '/vision/cone_valid',  # 라바콘 노드가 발행하는 최종 모드 플래그를 구독
+            '/vision/cone_valid',
             self.lane_switch_callback,
             10
         )
@@ -65,15 +64,13 @@ class LaneDetectionNode(Node):
             '/vision/lane_valid',
             10
         )
-    
-    # 🎯 [추가] 라바콘 노드의 상태를 수신하여 발행 주도권을 스위칭하는 콜백
+
     def lane_switch_callback(self, msg):
-        # 라바콘 노드에서 연속 20프레임 이상 차선이 보여서 True를 주면,
-        # 카메라 노드는 라바콘 모드를 해제(False)하고 자신이 토픽을 독점하기 시작합니다.
-        if msg.data is True:
-            if self.cone_mode_active:
-                self.get_logger().info("=====> Received Switch Signal from Cone Node! Camera Lane Node takes control.")
-                self.cone_mode_active = False
+        if not msg.data and self.cone_mode_active:
+            self.cone_mode_active = False
+            self.get_logger().info(
+                "Cone handoff complete. Camera lane node takes control."
+            )
 
     ##################################################
     # CAMERA CALLBACK
@@ -90,14 +87,23 @@ class LaneDetectionNode(Node):
 
             fit_x, valid = self.process_lane(frame)
 
-            # 🎯 [추가] 라바콘 모드가 아직 활성화되어 있는 동안에는 주행 경로 발행을 패스(양보)합니다.
             if self.cone_mode_active:
-                # 대신 라바콘 노드가 20프레임 성공 카운트를 계속 쌓을 수 있도록, 
-                # "나 지금 차선 잘 보여요" 플래그는 기존 토픽(/vision/lane_valid)으로 꾸준히 던져줍니다.
                 valid_msg = Bool()
                 valid_msg.data = valid
                 self.valid_pub.publish(valid_msg)
                 return
+
+            if valid and fit_x is not None:
+                self.last_fit_x = fit_x
+                self.lost_frame_count = 0
+            else:
+                self.lost_frame_count += 1
+                if self.last_fit_x is not None:
+                    fit_x = self.last_fit_x
+                    valid = True
+                else:
+                    fit_x = self.center_fallback_fit(frame)
+                    valid = True
 
             ##################################################
             # publish fit_x
@@ -128,6 +134,10 @@ class LaneDetectionNode(Node):
 
             # [수정 고침] 예외 발생 시에도 유효성 False 토픽을 명확히 전달
             self.valid_pub.publish(valid_msg)
+
+    def center_fallback_fit(self, frame):
+        h, w = frame.shape[:2]
+        return np.full(h, w // 2, dtype=np.float32)
 
     ##################################################
     # MAIN PIPELINE

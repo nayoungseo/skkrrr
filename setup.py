@@ -26,10 +26,9 @@ setup(
         'console_scripts': [
             'track_drive = track_drive.track_drive:main',
             'lane_detection = track_drive.lane_detection:main',
-            'lidar = track_drive.lidar:main',
             'cone_detection = track_drive.cone_detection:main',
-            'left_cone = track_drive.left_cone:main',
-            'left_co = track_drive.left_co:main'
+            'lidar = track_drive.lidar:main',
+            'obstacle_debug_viewer = track_drive.obstacle_debug_viewer:main'
         ],
     },
 )
