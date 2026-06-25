@@ -49,6 +49,12 @@ class TrackDriverNode(Node):
         # 차량 내부 이미지 크기 기본 규격 정의 (Sliding window 이미지 크기 기준)
         self.img_w = 640
         self.img_h = 480
+
+        # =========================
+        # Mission variables
+        # =========================
+        self.school_zone = False
+        self.traffic_light = "UNKNOWN"
         
         # ROS2 Publisher & Subscriber 설정
         self.motor_pub = self.create_publisher(XycarMotor,'xycar_motor',10)
@@ -80,6 +86,24 @@ class TrackDriverNode(Node):
         self.sub_obstacle = self.create_subscription(
             String, '/lidar/obstacle_status', self.obstacle_status_callback, 10)
         self.debug_timer = self.create_timer(1.0, self.debug_status_timer)
+
+        # =========================
+        # Mission Subscribers
+        # =========================
+
+        self.sub_school_zone = self.create_subscription(
+            Bool,
+            '/mission/school_zone',
+            self.school_zone_callback,
+            10
+        )
+
+        self.sub_traffic_light = self.create_subscription(
+            String,
+            '/mission/traffic_light',
+            self.traffic_light_callback,
+            10
+        )
 
         # --------------------------------------------------------
         # [신규 추가] 상태 제어 변수 및 모듈별 퍼블리셔 초기화
@@ -1316,6 +1340,12 @@ class TrackDriverNode(Node):
         self.last_scan_time = time.monotonic()
         self.lidar_ranges = msg.ranges
         self.latest_scan = msg
+
+    def school_zone_callback(self, msg):
+        self.school_zone = msg.data
+
+    def traffic_light_callback(self, msg):
+        self.traffic_light = msg.data
       
     #=============================================
     # 모터제어 토픽을 발행하는 Publisher 함수
@@ -1428,6 +1458,12 @@ class TrackDriverNode(Node):
     # [개선 고침] 3단계 다단 FSM 상태 판단 및 가변 파라미터 제어 파이프라인
     # ==============================================================================
     def process_autonomous_driving(self, fit_x):
+
+        # 빨간불
+        if self.traffic_light in ["RED", "YELLOW"]:
+            self.drive(0.0, 0.0)
+            return
+
         try:
             # Cone driving owns the command only while its virtual lane is valid.
             # The obstacle FSM is left untouched and resumes when cone mode ends.
@@ -1550,6 +1586,8 @@ class TrackDriverNode(Node):
                 final_angle = float(self.obstacle_angle_override)
                 self.prev_angle = final_angle
 
+            if self.school_zone:
+                final_speed = 6.0
             self.drive(final_angle, final_speed)
 
         except Exception as e:

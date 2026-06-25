@@ -139,6 +139,10 @@ class LaneDetectionNode(Node):
         h, w = frame.shape[:2]
         return np.full(h, w // 2, dtype=np.float32)
 
+    def center_fallback_fit(self, frame):
+        h, w = frame.shape[:2]
+        return np.full(h, w // 2, dtype=np.float32)
+
     ##################################################
     # MAIN PIPELINE
     ##################################################

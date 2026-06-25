@@ -27,8 +27,13 @@ setup(
             'track_drive = track_drive.track_drive:main',
             'lane_detection = track_drive.lane_detection:main',
             'cone_detection = track_drive.cone_detection:main',
+<<<<<<< HEAD
             'lidar = track_drive.lidar:main',
             'obstacle_debug_viewer = track_drive.obstacle_debug_viewer:main'
+=======
+            'mission = track_drive.mission_vision:main',
+            'obstacle = track_drive.obstacle_debug_viewer:main'
+>>>>>>> 0ceb7ac (신호등 로직 포함)
         ],
     },
 )
